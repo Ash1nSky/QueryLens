@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { Check, Copy } from 'lucide-react';
 import { cn } from '@/utils/cn';
 import type { Severity } from '@/lib/analyzer';
+import { DIALECT_LIST, getDialect, type DialectId } from '@/lib/dialects';
 
 export function Panel({ title, icon, actions, children, className, bodyClassName }: { title?: ReactNode; icon?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; bodyClassName?: string }) {
   return (
@@ -87,6 +88,32 @@ export function Toggle({ checked, onChange, label, hint }: { checked: boolean; o
         <span className="text-sm text-slate-200">{label}</span>
         {hint && <span className="text-xs text-slate-500">{hint}</span>}
       </span>
+    </label>
+  );
+}
+
+export const DIALECT_STYLES: Record<DialectId, string> = {
+  generic: 'border-slate-500/40 bg-slate-500/15 text-slate-300',
+  postgres: 'border-sky-500/40 bg-sky-500/15 text-sky-300',
+  mysql: 'border-orange-500/40 bg-orange-500/15 text-orange-300',
+  mssql: 'border-rose-500/40 bg-rose-500/15 text-rose-300',
+  sqlite: 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300',
+};
+
+/** Small badge naming the dialect a finding came from. */
+export function DialectChip({ dialect, className, title }: { dialect: DialectId; className?: string; title?: string }) {
+  const info = getDialect(dialect).info;
+  return <span className={cn('chip font-mono uppercase tracking-wide', DIALECT_STYLES[dialect], className)} title={title ?? `${info.label}-specific`}>{info.short}</span>;
+}
+
+/** Dropdown to pick the analysis dialect. */
+export function DialectSelect({ value, onChange, className, compact }: { value: DialectId; onChange: (d: DialectId) => void; className?: string; compact?: boolean }) {
+  return (
+    <label className={cn('flex items-center gap-1.5 text-xs text-slate-400', className)} title="Dialect-specific rules are layered on top of the generic SQL ruleset">
+      {!compact && <span className="hidden sm:inline">Dialect</span>}
+      <select className="input !w-auto !py-1 text-xs" value={value} onChange={(e) => onChange(e.target.value as DialectId)}>
+        {DIALECT_LIST.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+      </select>
     </label>
   );
 }

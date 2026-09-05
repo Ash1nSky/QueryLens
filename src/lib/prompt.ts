@@ -66,7 +66,7 @@ export function buildPrompt(o: PromptOptions): string {
     const relevant = o.analysis.issues.filter((i) => i.severity !== 'good');
     if (relevant.length) {
       lines.push('## Findings from my static analysis (please confirm or refute)');
-      for (const i of relevant) lines.push(`- [${i.severity.toUpperCase()}] ${i.title}: ${i.description}`);
+      for (const i of relevant) lines.push(`- [${i.severity.toUpperCase()}${i.dialect && i.dialect !== 'generic' ? `, ${o.analysis.dialectLabel}-specific` : ''}] ${i.title}: ${i.description}`);
       lines.push('');
     }
     if (o.analysis.indexSuggestions.length) {

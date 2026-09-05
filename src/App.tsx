@@ -4,6 +4,7 @@ import { AnalyzerView } from './components/AnalyzerView';
 import { PlaygroundView } from './components/PlaygroundView';
 import { PromptBuilderView } from './components/PromptBuilderView';
 import { ANALYZER_SAMPLES, PLAYGROUND_SCENARIOS } from './lib/samples';
+import { DEFAULT_DIALECT, isDialectId, type DialectId } from './lib/dialects';
 import { cn } from './utils/cn';
 
 type Mode = 'analyze' | 'playground' | 'prompt';
@@ -26,14 +27,18 @@ export default function App() {
     try { const s = JSON.parse(localStorage.getItem(LS_KEY) ?? '{}'); if (typeof s.playgroundScript === 'string') return s.playgroundScript; } catch { /* ignore */ }
     return PLAYGROUND_SCENARIOS[0].sql;
   });
+  const [dialect, setDialect] = useState<DialectId>(() => {
+    try { const s = JSON.parse(localStorage.getItem(LS_KEY) ?? '{}'); if (isDialectId(s.dialect)) return s.dialect; } catch { /* ignore */ }
+    return DEFAULT_DIALECT;
+  });
   const [promptSql, setPromptSql] = useState<string>(analyzerSql);
   const [schemaDdl, setSchemaDdl] = useState('');
   const [showHero, setShowHero] = useState(() => { try { return localStorage.getItem('querylens.hero') !== 'hidden'; } catch { return true; } });
 
   useEffect(() => {
-    const id = setTimeout(() => { try { localStorage.setItem(LS_KEY, JSON.stringify({ analyzerSql, playgroundScript })); } catch { /* ignore */ } }, 400);
+    const id = setTimeout(() => { try { localStorage.setItem(LS_KEY, JSON.stringify({ analyzerSql, playgroundScript, dialect })); } catch { /* ignore */ } }, 400);
     return () => clearTimeout(id);
-  }, [analyzerSql, playgroundScript]);
+  }, [analyzerSql, playgroundScript, dialect]);
 
   const goAnalyze = useCallback((sql: string) => { setAnalyzerSql(sql); setMode('analyze'); window.scrollTo({ top: 0, behavior: 'smooth' }); }, []);
   const goPlayground = useCallback((sql: string) => { setPlaygroundScript((prev) => (prev.trim() ? prev.replace(/\s*$/, '') + '\n\n-- From analyzer\n' + sql : sql)); setMode('playground'); window.scrollTo({ top: 0, behavior: 'smooth' }); }, []);
@@ -105,9 +110,9 @@ export default function App() {
         )}
 
         <div key={mode} className="fade-up">
-          {mode === 'analyze' && <AnalyzerView sql={analyzerSql} setSql={setAnalyzerSql} onAskAi={goPrompt} onTryInPlayground={goPlayground} />}
+          {mode === 'analyze' && <AnalyzerView sql={analyzerSql} setSql={setAnalyzerSql} dialect={dialect} setDialect={setDialect} onAskAi={goPrompt} onTryInPlayground={goPlayground} />}
           {mode === 'playground' && <PlaygroundView script={playgroundScript} setScript={setPlaygroundScript} onAnalyze={goAnalyze} onSchemaChange={handleSchema} />}
-          {mode === 'prompt' && <PromptBuilderView sql={promptSql} setSql={setPromptSql} schemaDdl={schemaDdl} />}
+          {mode === 'prompt' && <PromptBuilderView sql={promptSql} setSql={setPromptSql} schemaDdl={schemaDdl} analyzerDialect={dialect} />}
         </div>
       </main>
 

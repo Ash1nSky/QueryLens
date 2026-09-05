@@ -67,6 +67,48 @@ SELECT id, title, 'video' AS kind FROM videos WHERE published = 1
 ORDER BY id DESC
 LIMIT 50;`,
   },
+  {
+    name: 'Dialect: PostgreSQL report',
+    sql: `SELECT u."Email", lower(u.email) AS e, count(*) AS orders
+FROM "Users" u
+JOIN orders o ON o.user_id = u.id
+WHERE date_trunc('day', o.created_at) = '2024-03-01'
+  AND o.meta->>'channel' = 'web'
+  AND u.status ILIKE 'act%'
+GROUP BY u."Email", lower(u.email)
+ORDER BY orders DESC
+LIMIT 20 OFFSET 2000;`,
+  },
+  {
+    name: 'Dialect: MySQL report',
+    sql: `SELECT o.id, o.status, c.name, c.phone, SUM(o.total) AS revenue
+FROM \`orders\` o
+JOIN customers c ON c.id = o.customer_id
+WHERE DATE_FORMAT(o.created_at, '%Y-%m') = '2024-03'
+  AND c.phone = 9876543210
+GROUP BY c.id
+LIMIT 10, 20;`,
+  },
+  {
+    name: 'Dialect: SQL Server report',
+    sql: `SELECT TOP 50 o.OrderId, o.Status, c.Name
+FROM dbo.Orders o WITH (NOLOCK)
+JOIN dbo.Customers c ON c.CustomerId = o.CustomerId
+WHERE ISNULL(o.Status, 'new') = 'new'
+  AND c.Email = N'someone@example.com'
+  AND DATEDIFF(day, o.CreatedAt, GETDATE()) < 30
+  AND DATEADD(day, 7, o.ShippedAt) < GETDATE();`,
+  },
+  {
+    name: 'Dialect: SQLite schema + query',
+    sql: `CREATE TABLE events (
+  id INT PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER REFERENCES users(id),
+  kind VARCHAR(50),
+  amount DECIMAL(10,2),
+  created_at DATETIME
+);`,
+  },
 ];
 
 export const PLAYGROUND_SCENARIOS: { name: string; description: string; sql: string }[] = [

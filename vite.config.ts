@@ -16,4 +16,8 @@ export default defineConfig({
       "@": path.resolve(__dirname, "src"),
     },
   },
+  server: {
+    // allow hosted previews (e.g. *.e2b.app) — the app has no backend, so this is purely a dev convenience
+    allowedHosts: true,
+  },
 });

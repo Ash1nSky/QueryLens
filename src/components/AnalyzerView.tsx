@@ -1,25 +1,34 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, ArrowRight, BookOpen, Braces, Database, FlaskConical, Gauge, Lightbulb, ListTree, Sparkles, Wand2, Wrench, Zap } from 'lucide-react';
 import { analyzeSql, type QueryAnalysis, type Severity } from '@/lib/analyzer';
+import { detectDialect, getDialect, type DialectId } from '@/lib/dialects';
 import { ANALYZER_SAMPLES } from '@/lib/samples';
 import { SqlCode, SqlEditor } from './SqlEditor';
-import { Chip, CopyButton, EmptyState, Panel, RichText, SEVERITY_STYLES, SeverityChip } from './ui';
+import { Chip, CopyButton, DialectChip, DialectSelect, EmptyState, Panel, RichText, SEVERITY_STYLES, SeverityChip } from './ui';
 import { cn } from '@/utils/cn';
 
 interface Props {
   sql: string;
   setSql: (s: string) => void;
+  dialect: DialectId;
+  setDialect: (d: DialectId) => void;
   onAskAi: (analysis: QueryAnalysis) => void;
   onTryInPlayground: (sql: string) => void;
 }
 
 type Tab = 'explain' | 'issues' | 'optimized' | 'indexes' | 'structure';
 
-export function AnalyzerView({ sql, setSql, onAskAi, onTryInPlayground }: Props) {
+export function AnalyzerView({ sql, setSql, dialect, setDialect, onAskAi, onTryInPlayground }: Props) {
   const [tab, setTab] = useState<Tab>('explain');
   const [debounced, setDebounced] = useState(sql);
   useEffect(() => { const id = setTimeout(() => setDebounced(sql), 250); return () => clearTimeout(id); }, [sql]);
-  const analysis = useMemo(() => (debounced.trim() ? analyzeSql(debounced) : null), [debounced]);
+  const analysis = useMemo(() => (debounced.trim() ? analyzeSql(debounced, { dialect }) : null), [debounced, dialect]);
+  // Suggest switching when the SQL clearly looks like a different engine's dialect.
+  const detected = useMemo(() => (debounced.trim() ? detectDialect(debounced) : null), [debounced]);
+  const [dismissedHint, setDismissedHint] = useState<string | null>(null);
+  const hintKey = detected ? `${detected.id}:${debounced.length}` : null;
+  const showHint = !!detected && detected.id !== dialect && dismissedHint !== hintKey;
+  const dialectFindings = analysis?.issues.filter((i) => i.dialect && i.dialect !== 'generic').length ?? 0;
 
   const counts = useMemo(() => {
     const c: Record<Severity, number> = { critical: 0, high: 0, medium: 0, low: 0, info: 0, good: 0 };
@@ -42,6 +51,7 @@ export function AnalyzerView({ sql, setSql, onAskAi, onTryInPlayground }: Props)
       <div className="flex flex-col gap-4 lg:sticky lg:top-20 lg:self-start">
         <Panel title="Your SQL" icon={<Braces size={16} />} actions={
           <div className="flex items-center gap-2">
+            <DialectSelect value={dialect} onChange={setDialect} compact />
             <select className="input !w-auto !py-1 text-xs" value="" onChange={(e) => { const s = ANALYZER_SAMPLES.find((x) => x.name === e.target.value); if (s) setSql(s.sql); }}>
               <option value="" disabled>Load an example…</option>
               {ANALYZER_SAMPLES.map((s) => <option key={s.name} value={s.name}>{s.name}</option>)}
@@ -50,8 +60,16 @@ export function AnalyzerView({ sql, setSql, onAskAi, onTryInPlayground }: Props)
         }>
           <div className="p-3">
             <SqlEditor value={sql} onChange={setSql} minHeight={320} placeholder={'Paste a SELECT, INSERT, UPDATE, DELETE or CREATE statement…\nAnalysis runs locally as you type.'} />
+            {showHint && detected && (
+              <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-sky-500/25 bg-sky-500/[0.06] px-3 py-2 text-xs text-slate-300">
+                <DialectChip dialect={detected.id} />
+                <span>This looks like <strong className="text-slate-100">{getDialect(detected.id).info.label}</strong> <span className="text-slate-500">({detected.reason})</span>.</span>
+                <button className="btn !py-0.5 text-[11px]" onClick={() => setDialect(detected.id)}>Use {getDialect(detected.id).info.label} rules</button>
+                <button className="ml-auto text-slate-500 hover:text-slate-300" onClick={() => setDismissedHint(hintKey)} aria-label="Dismiss">✕</button>
+              </div>
+            )}
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <p className="flex items-center gap-1.5 text-[11px] text-slate-500"><span className="h-1.5 w-1.5 rounded-full bg-mint-400 pulse-ring" />Analyzed in your browser — nothing is sent anywhere.</p>
+              <p className="flex items-center gap-1.5 text-[11px] text-slate-500"><span className="h-1.5 w-1.5 rounded-full bg-mint-400 pulse-ring" />Analyzed in your browser — nothing is sent anywhere.{dialect !== 'generic' && <span className="ml-1 flex items-center gap-1">· <DialectChip dialect={dialect} /> {getDialect(dialect).info.label} rules{dialectFindings ? ` (${dialectFindings} finding${dialectFindings > 1 ? 's' : ''})` : ''}</span>}</p>
               <div className="flex gap-2">
                 <button className="btn text-xs" onClick={() => onTryInPlayground(sql)} disabled={!sql.trim()}><FlaskConical size={14} />Try in playground</button>
                 <button className="btn btn-primary text-xs" onClick={() => analysis && onAskAi(analysis)} disabled={!analysis}><Sparkles size={14} />Build AI prompt</button>
@@ -63,7 +81,7 @@ export function AnalyzerView({ sql, setSql, onAskAi, onTryInPlayground }: Props)
         {analysis && !analysis.parseError && (
           <Panel title="At a glance" icon={<Gauge size={16} />}>
             <div className="grid grid-cols-2 gap-px bg-white/5 sm:grid-cols-4">
-              <Stat label="Statement" value={analysis.statementType} />
+              <Stat label="Statement" value={analysis.statementType} sub={dialect !== 'generic' ? getDialect(dialect).info.label : 'generic SQL'} />
               <Stat label="Tables" value={String(analysis.tables.filter((t) => !t.isSubquery).length)} sub={analysis.tables.length > 1 ? `${analysis.tables.length - 1} join${analysis.tables.length > 2 ? 's' : ''}` : undefined} />
               <Stat label="Complexity" value={analysis.complexity.label} sub={`score ${analysis.complexity.score}`} tone={analysis.complexity.score > 15 ? 'rose' : analysis.complexity.score > 8 ? 'amber' : 'mint'} />
               <Stat label="Findings" value={String(problemCount)} sub={counts.critical ? `${counts.critical} critical` : counts.high ? `${counts.high} high` : problemCount ? 'minor' : 'clean'} tone={counts.critical ? 'rose' : counts.high ? 'orange' : problemCount ? 'amber' : 'mint'} />
@@ -155,18 +173,22 @@ export function ExplainTab({ a }: { a: QueryAnalysis }) {
 export function IssuesTab({ a }: { a: QueryAnalysis }) {
   const [filter, setFilter] = useState<string>('all');
   const cats = Array.from(new Set(a.issues.map((i) => i.category)));
-  const list = a.issues.filter((i) => filter === 'all' || i.category === filter);
-  if (!a.issues.length) return <EmptyState icon={<Lightbulb size={32} />} title="No findings" hint="Nothing stood out in this statement." />;
+  const hasDialect = a.dialect !== 'generic' && a.issues.some((i) => i.dialect);
+  const list = a.issues.filter((i) => filter === 'all' || i.category === filter || (filter === '__dialect' && i.dialect));
+  if (!a.issues.length) return <EmptyState icon={<Lightbulb size={32} />} title="No findings" hint={a.dialect !== 'generic' ? `Nothing stood out — generic and ${a.dialectLabel} rules both passed.` : 'Nothing stood out in this statement.'} />;
   return (
     <div className="fade-up space-y-3">
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
         {['all', ...cats].map((c) => <button key={c} onClick={() => setFilter(c)} className={cn('chip cursor-pointer capitalize', filter === c ? 'border-mint-500/40 bg-mint-500/15 text-mint-400' : 'border-white/10 bg-white/5 text-slate-400 hover:text-slate-200')}>{c}</button>)}
+        {hasDialect && <button onClick={() => setFilter('__dialect')} className={cn('chip cursor-pointer', filter === '__dialect' ? 'border-mint-500/40 bg-mint-500/15 text-mint-400' : 'border-white/10 bg-white/5 text-slate-400 hover:text-slate-200')}>{a.dialectLabel}-specific</button>}
+        {a.dialect === 'generic' && <span className="ml-auto text-[11px] text-slate-500">Pick a dialect above for engine-specific advice.</span>}
       </div>
       {list.map((i) => (
         <div key={i.id} className={cn('rounded-xl border p-3', i.severity === 'critical' ? 'border-rose-500/30 bg-rose-500/[0.06]' : i.severity === 'high' ? 'border-orange-500/25 bg-orange-500/[0.05]' : i.severity === 'good' ? 'border-mint-500/25 bg-mint-500/[0.05]' : 'border-white/6 bg-white/[0.02]')}>
           <div className="flex flex-wrap items-center gap-2">
             <SeverityChip severity={i.severity} />
             <span className="chip border-white/10 bg-white/5 capitalize text-slate-400">{i.category}</span>
+            {i.dialect && i.dialect !== 'generic' && <DialectChip dialect={i.dialect} />}
             {i.autoFixed && <span className="chip border-mint-500/30 bg-mint-500/10 text-mint-400"><Wrench size={11} />auto-fixed in rewrite</span>}
           </div>
           <h4 className="mt-2 text-sm font-semibold text-slate-100">{i.title}</h4>
@@ -186,7 +208,7 @@ export function OptimizedTab({ a, onTry }: { a: QueryAnalysis; onTry: (s: string
         <>
           <div className="rounded-xl border border-mint-500/25 bg-mint-500/[0.04]">
             <div className="flex items-center justify-between border-b border-white/6 px-3 py-2">
-              <span className="flex items-center gap-2 text-sm font-semibold text-mint-400"><Wand2 size={14} />Optimized rewrite (semantics-preserving)</span>
+              <span className="flex items-center gap-2 text-sm font-semibold text-mint-400"><Wand2 size={14} />Optimized rewrite (semantics-preserving){a.dialect !== 'generic' && <DialectChip dialect={a.dialect} title={`Formatted and rewritten for ${a.dialectLabel}`} />}</span>
               <div className="flex gap-2"><button className="btn text-xs" onClick={() => onTry(a.rewritten!)}><FlaskConical size={13} />Try</button><CopyButton text={a.rewritten} /></div>
             </div>
             <SqlCode sql={a.rewritten} className="p-3" />
@@ -213,7 +235,7 @@ export function OptimizedTab({ a, onTry }: { a: QueryAnalysis; onTry: (s: string
             {manual.map((i) => (
               <div key={i.id} className="flex gap-3 rounded-lg border border-white/6 bg-white/[0.02] p-3">
                 <span className={cn('mt-1 h-2 w-2 shrink-0 rounded-full', SEVERITY_STYLES[i.severity].dot)} />
-                <div><p className="text-sm font-medium text-slate-200">{i.title}</p><p className="text-sm text-slate-400"><RichText text={i.suggestion!} /></p></div>
+                <div><p className="flex items-center gap-2 text-sm font-medium text-slate-200">{i.title}{i.dialect && i.dialect !== 'generic' && <DialectChip dialect={i.dialect} />}</p><p className="text-sm text-slate-400"><RichText text={i.suggestion!} /></p></div>
               </div>
             ))}
           </div>
@@ -227,7 +249,7 @@ export function IndexesTab({ a }: { a: QueryAnalysis }) {
   if (!a.indexSuggestions.length) return <EmptyState icon={<Zap size={32} />} title="No index suggestions" hint={a.statementType === 'SELECT' || a.statementType === 'UPDATE' || a.statementType === 'DELETE' ? 'Suggestions are derived from WHERE, JOIN, ORDER BY and GROUP BY columns. Qualify columns with table aliases (u.email) so they can be attributed to a table.' : 'Index suggestions apply to SELECT, UPDATE and DELETE statements.'} />;
   return (
     <div className="fade-up space-y-3">
-      <p className="text-xs text-slate-500">Heuristic suggestions: equality columns first, then one range column, then sort/group columns. Verify with EXPLAIN on real data before creating — every index costs write throughput.</p>
+      <p className="text-xs text-slate-500">Heuristic suggestions: equality columns first, then one range column, then sort/group columns. Verify with {getDialect(a.dialect).explainTip} on real data before creating — every index costs write throughput.{a.dialect !== 'generic' && <> DDL is written in {a.dialectLabel} syntax.</>}</p>
       {a.indexSuggestions.map((s, i) => (
         <div key={i} className="rounded-xl border border-white/6 bg-white/[0.02] p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">

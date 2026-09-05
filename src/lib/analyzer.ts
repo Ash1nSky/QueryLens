@@ -1,5 +1,7 @@
 import { format } from 'sql-formatter';
 import { AGGREGATES, WINDOW_FUNCS, Token, joinTokens, stripComments, tokenize, unquoteIdent } from './tokenizer';
+import { DEFAULT_DIALECT, getDialect, type DialectId, type DialectPack, type RuleContext } from './dialects';
+import type { DdlColumn } from './dialects/types';
 
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info' | 'good';
 
@@ -11,6 +13,13 @@ export interface Issue {
   suggestion?: string;
   autoFixed?: boolean;
   category: 'performance' | 'correctness' | 'readability' | 'safety' | 'security';
+  /** Set when the finding was added or amended by a dialect rule pack. */
+  dialect?: DialectId;
+}
+
+export interface AnalyzeOptions {
+  /** Which rule pack to layer on top of the generic ruleset. Defaults to `generic`. */
+  dialect?: DialectId;
 }
 
 export interface TableRef {
@@ -78,6 +87,10 @@ export interface QueryAnalysis {
   indexSuggestions: IndexSuggestion[];
   complexity: { score: number; label: string; factors: string[] };
   parseError?: string;
+  /** Dialect the analysis was run with. */
+  dialect: DialectId;
+  /** Human label of the dialect (for UI badges). */
+  dialectLabel: string;
 }
 
 // ---------- helpers ----------
@@ -362,23 +375,26 @@ function splitList(tokens: Token[], baseDepth: number): string[] {
 }
 
 // ---------- analysis ----------
-export function analyzeSql(sql: string): QueryAnalysis {
+export function analyzeSql(sql: string, options: AnalyzeOptions = {}): QueryAnalysis {
   const original = sql;
+  const pack: DialectPack = getDialect(options.dialect ?? DEFAULT_DIALECT);
   const allTokens = tokenize(sql);
   const tokens = stripComments(allTokens).filter((t) => !(t.type === 'punct' && t.value === ';'));
-  let formatted = sql;
-  try { formatted = format(sql, { language: 'sql', keywordCase: 'upper', tabWidth: 2 }); } catch { /* ignore */ }
+  const formatted = formatSql(sql, pack);
 
   const analysis: QueryAnalysis = {
     original, formatted, statementType: 'UNKNOWN', summary: '', tables: [], selectColumns: [], selectStar: false, distinct: false,
     conditions: [], groupBy: [], orderBy: [], ctes: [], subqueryCount: 0, maxDepth: 0, aggregates: [], windowFunctions: [],
     setOperations: [], parameters: [], explanation: [], issues: [], rewriteNotes: [], indexSuggestions: [],
     complexity: { score: 0, label: 'Simple', factors: [] },
+    dialect: pack.info.id, dialectLabel: pack.info.label,
   };
   if (tokens.length === 0) { analysis.parseError = 'No SQL found. Paste a query to analyze it.'; return analysis; }
 
   const issues: Issue[] = [];
   const add = (i: Issue) => { if (!issues.some((x) => x.id === i.id)) issues.push(i); };
+  /** Columns parsed from CREATE TABLE, handed to dialect packs. */
+  let ddlColumns: DdlColumn[] = [];
 
   // parameters
   analysis.parameters = Array.from(new Set(tokens.filter((t) => t.type === 'param').map((t) => t.value)));
@@ -619,12 +635,12 @@ export function analyzeSql(sql: string): QueryAnalysis {
     if (analysis.windowFunctions.length && analysis.tables.length && !analysis.conditions.length) add({ id: 'window-no-filter', severity: 'info', category: 'performance', title: 'Window functions over an unfiltered table', description: 'Window functions materialise and sort their partitions; without a WHERE clause that is the entire table.' });
     if (/\bLIKE\s+'%[^%]*%'/i.test(sql)) add({ id: 'double-wildcard', severity: 'info', category: 'performance', title: 'Substring search with %term%', description: 'Consider a full-text index (PostgreSQL tsvector / GIN, MySQL FULLTEXT) for search features.' });
     if (analysis.parameters.length) add({ id: 'params-good', severity: 'good', category: 'security', title: 'Uses bound parameters', description: `Parameters ${analysis.parameters.join(', ')} keep data out of the SQL text — safe from injection and plan-cache friendly.` });
-    if (!issues.some((i) => i.severity === 'critical' || i.severity === 'high') && analysis.conditions.length && analysis.tables.length) add({ id: 'looks-good', severity: 'good', category: 'performance', title: 'No major performance anti-patterns detected', description: 'The query structure is sound. Verify with EXPLAIN that the predicates hit indexes.' });
+    if (!issues.some((i) => i.severity === 'critical' || i.severity === 'high') && analysis.conditions.length && analysis.tables.length) add({ id: 'looks-good', severity: 'good', category: 'performance', title: 'No major performance anti-patterns detected', description: `The query structure is sound. Verify with ${pack.explainTip} that the predicates hit indexes.` });
 
     // ---- rewrite ----
-    analysis.rewritten = buildRewrite(sql, analysis, issues);
+    analysis.rewritten = buildRewrite(sql, analysis, issues, pack);
     // ---- indexes ----
-    analysis.indexSuggestions = suggestIndexes(analysis);
+    analysis.indexSuggestions = suggestIndexes(analysis, pack);
   }
   // ===================== INSERT =====================
   else if (stype === 'INSERT' || stype === 'REPLACE') {
@@ -678,8 +694,8 @@ export function analyzeSql(sql: string): QueryAnalysis {
     if (assignments.some((a) => /=\s*NULL$/i.test(a) === false && /^\w+\s*=\s*\w+\s*$/.test(a) && a.split('=')[0].trim() === a.split('=')[1].trim())) add({ id: 'noop-assign', severity: 'low', category: 'readability', title: 'Column assigned to itself', description: 'A no-op assignment still writes the row (and fires triggers).' });
     if (primary.some((t) => t.depth === baseDepth && isKw(t, 'JOIN', 'FROM'))) add({ id: 'update-join', severity: 'info', category: 'correctness', title: 'UPDATE with JOIN / FROM', description: 'Syntax differs across databases (MySQL `UPDATE a JOIN b`, PostgreSQL `UPDATE a ... FROM b`, SQL Server `UPDATE a ... FROM a JOIN b`). Ensure one source row per target row to avoid nondeterministic results.' });
     if (analysis.parameters.length) add({ id: 'params-good', severity: 'good', category: 'security', title: 'Uses bound parameters', description: 'Values are parameterised — safe from injection.' });
-    analysis.rewritten = buildRewrite(sql, analysis, issues);
-    analysis.indexSuggestions = suggestIndexes(analysis);
+    analysis.rewritten = buildRewrite(sql, analysis, issues, pack);
+    analysis.indexSuggestions = suggestIndexes(analysis, pack);
   }
   // ===================== DELETE =====================
   else if (stype === 'DELETE') {
@@ -701,8 +717,8 @@ export function analyzeSql(sql: string): QueryAnalysis {
       if (c.wrappedColumn) add({ id: 'fn-on-column', severity: 'high', category: 'performance', title: 'Function on column in WHERE', description: `\`${c.raw}\` prevents index usage when locating rows.`, suggestion: 'Compare the raw column against a range.' });
     }
     if (analysis.conditions.length && !analysis.limit) add({ id: 'delete-batch', severity: 'info', category: 'performance', title: 'Large deletes should be batched', description: 'If this can match millions of rows, delete in chunks (e.g. by id range or `LIMIT 5000` in a loop) to keep locks and transaction logs small.' });
-    analysis.rewritten = buildRewrite(sql, analysis, issues);
-    analysis.indexSuggestions = suggestIndexes(analysis);
+    analysis.rewritten = buildRewrite(sql, analysis, issues, pack);
+    analysis.indexSuggestions = suggestIndexes(analysis, pack);
   }
   // ===================== CREATE TABLE =====================
   else if (stype === 'CREATE' && primary.some((t) => isKw(t, 'TABLE'))) {
@@ -733,6 +749,7 @@ export function analyzeSql(sql: string): QueryAnalysis {
       if (/DEFAULT/.test(rest)) flags.push('DEFAULT');
       columns.push({ name, type: typeToks.join('').replace(/\(/g, '(').toUpperCase() || 'ANY', flags });
     }
+    ddlColumns = columns;
     analysis.selectColumns = columns.map((c) => `${c.name} ${c.type}${c.flags.length ? ' [' + c.flags.join(', ') + ']' : ''}`);
     explanation.push({ order: order++, clause: 'CREATE', title: `Create table \`${table}\` with ${columns.length} columns`, details: columns.map((c) => `\`${c.name}\` of type ${c.type}${c.flags.length ? ` (${c.flags.join(', ')})` : ''}.`) });
     if (constraints.length) explanation.push({ order: order++, clause: 'CONSTRAINTS', title: `${constraints.length} table-level constraint${constraints.length > 1 ? 's' : ''}`, details: constraints.map((c) => `\`${c}\``) });
@@ -784,6 +801,15 @@ export function analyzeSql(sql: string): QueryAnalysis {
   }
 
   analysis.explanation = explanation;
+
+  // ---- dialect-specific rule pack (runs after the generic ruleset so it can amend/remove) ----
+  if (pack.info.id !== 'generic') {
+    try { runDialectPack(pack, sql, tokens, analysis, issues, ddlColumns); } catch { /* a dialect rule must never break the analysis */ }
+  }
+
+  // a clean bill of health should not be shown next to a critical/high dialect finding
+  if (issues.some((i) => i.severity === 'critical' || i.severity === 'high')) { const k = issues.findIndex((i) => i.id === 'looks-good'); if (k >= 0) issues.splice(k, 1); }
+
   const sevRank: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4, good: 5 };
   analysis.issues = issues.sort((a, b) => sevRank[a.severity] - sevRank[b.severity]);
 
@@ -806,10 +832,24 @@ export function analyzeSql(sql: string): QueryAnalysis {
 }
 
 // ---------- rewrite ----------
-function buildRewrite(sql: string, a: QueryAnalysis, issues: Issue[]): string | undefined {
+function buildRewrite(sql: string, a: QueryAnalysis, issues: Issue[], pack: DialectPack): string | undefined {
   let out = sql.replace(/;\s*$/, '');
   const notes: string[] = [];
   let changed = false;
+
+  // dialect-specific rewrites run first: they know engine-native forms (e.g. date_trunc, DATE_FORMAT, ISNULL)
+  if (pack.rewrite) {
+    try {
+      const ctx = makeRuleContext(pack, sql, tokenize(sql).filter((t) => t.type !== 'comment'), a, issues, []);
+      const r = pack.rewrite(out, ctx);
+      if (r.sql !== out) {
+        out = r.sql; notes.push(...r.notes); changed = true;
+        // the dialect rules have not run yet, so remember the ids and mark them afterwards
+        pendingFixes.set(a, [...(pendingFixes.get(a) ?? []), ...r.fixed]);
+        for (const id of r.fixed) { const iss = issues.find((i) => i.id === id); if (iss) iss.autoFixed = true; }
+      }
+    } catch { /* ignore */ }
+  }
 
   // = NULL -> IS NULL
   const nullRe = /(\S+)\s*(!=|<>)\s*NULL\b/gi;
@@ -889,11 +929,86 @@ function buildRewrite(sql: string, a: QueryAnalysis, issues: Issue[]): string | 
   // UNION -> keep, just note
   if (!changed) { a.rewriteNotes = []; return undefined; }
   a.rewriteNotes = notes;
-  try { return format(out, { language: 'sql', keywordCase: 'upper', tabWidth: 2 }); } catch { return out; }
+  return formatSql(out, pack);
+}
+
+/** Format with the dialect's sql-formatter language, falling back to generic SQL and then to the raw text. */
+function formatSql(sql: string, pack: DialectPack): string {
+  try { return format(sql, { language: pack.info.formatter, keywordCase: 'upper', tabWidth: 2 }); } catch { /* fall through */ }
+  if (pack.info.formatter !== 'sql') { try { return format(sql, { language: 'sql', keywordCase: 'upper', tabWidth: 2 }); } catch { /* fall through */ } }
+  return sql;
+}
+
+// ---------- dialect plumbing ----------
+/** Blank out string-literal bodies so keyword regexes never match inside quotes. Comments are already stripped from tokens, so do it on the text. */
+function blankStrings(sql: string): string {
+  return sql
+    .replace(/--[^\n]*/g, (m) => ' '.repeat(m.length))
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/N?'(?:[^']|'')*'/g, (m) => "'" + ' '.repeat(Math.max(0, m.length - 2)) + "'");
+}
+
+/** Issue ids that a dialect rewrite fixed, keyed by analysis — applied after the dialect rules have run. */
+const pendingFixes = new WeakMap<QueryAnalysis, string[]>();
+
+function makeRuleContext(pack: DialectPack, sql: string, tokens: Token[], a: QueryAnalysis, issues: Issue[], columns: DdlColumn[]): RuleContext {
+  const code = blankStrings(sql);
+  const fnNames = new Set(tokens.filter((t) => t.type === 'function').map((t) => t.upper));
+  const words = new Set(tokens.filter((t) => t.type === 'keyword' || t.type === 'identifier').map((t) => t.upper));
+  const id = pack.info.id;
+  const aliases = new Map<string, string>();
+  const amend: RuleContext['amend'] = (iid, patch) => {
+    const k = issues.findIndex((x) => x.id === iid);
+    if (k < 0) return;
+    const cur = issues[k];
+    const next: Issue = { ...cur, dialect: id };
+    for (const key of Object.keys(patch) as (keyof Issue)[]) {
+      const v = patch[key];
+      (next as unknown as Record<string, unknown>)[key] = typeof v === 'function' ? (v as (i: Issue) => unknown)(cur) : v;
+    }
+    issues[k] = next;
+  };
+  return {
+    dialect: id, sql, code, tokens, a, issues, columns,
+    rewrittenCode: a.rewritten ? blankStrings(a.rewritten) : undefined,
+    add: (i) => { if (!issues.some((x) => x.id === i.id)) issues.push({ ...i, dialect: id }); },
+    has: (iid) => issues.some((x) => x.id === iid),
+    remove: (iid) => { const k = issues.findIndex((x) => x.id === iid); if (k >= 0) issues.splice(k, 1); },
+    amend,
+    fnIssue: (names, issue) => {
+      const upper = names.map((n) => n.toUpperCase());
+      const existing = issues.find((x) => upper.some((n) => x.id === `fn-on-column-${n}`))
+        ?? (issues.find((x) => x.id === 'fn-on-column' && a.conditions.some((c) => c.wrappedColumn && upper.includes(c.wrappedColumn))));
+      if (existing) {
+        aliases.set(issue.id, existing.id);
+        const { id: _drop, ...rest } = issue; void _drop;
+        amend(existing.id, rest);
+      } else if (!issues.some((x) => x.id === issue.id)) {
+        issues.push({ ...issue, dialect: id });
+      }
+    },
+    resolveId: (iid) => aliases.get(iid) ?? iid,
+    fn: (...names) => names.some((n) => fnNames.has(n.toUpperCase())),
+    fns: (names) => names.filter((n) => fnNames.has(n.toUpperCase())),
+    kw: (...w) => w.some((n) => words.has(n.toUpperCase())),
+    re: (r) => r.test(code),
+  };
+}
+
+function runDialectPack(pack: DialectPack, sql: string, tokens: Token[], a: QueryAnalysis, issues: Issue[], columns: DdlColumn[]): void {
+  const ctx = makeRuleContext(pack, sql, tokens, a, issues, columns);
+  pack.rules(ctx);
+  // rewrites ran before the rules existed — mark their targets now
+  for (const fid of pendingFixes.get(a) ?? []) {
+    const real = ctx.resolveId(fid);
+    const iss = issues.find((i) => i.id === real || i.id === fid);
+    if (iss) iss.autoFixed = true;
+  }
 }
 
 // ---------- index suggestions ----------
-function suggestIndexes(a: QueryAnalysis): IndexSuggestion[] {
+function suggestIndexes(a: QueryAnalysis, pack: DialectPack): IndexSuggestion[] {
+  const ddl = (table: string, cols: string[]) => pack.indexDdl({ table, name: `idx_${table.split('.').pop()}_${cols.join('_')}`, columns: cols });
   const out: IndexSuggestion[] = [];
   const realTables = a.tables.filter((t) => !t.isSubquery && !a.ctes.includes(t.name));
   if (!realTables.length) return out;
@@ -945,11 +1060,11 @@ function suggestIndexes(a: QueryAnalysis): IndexSuggestion[] {
     if (b.eq.length) reasons.push(`equality filter on ${b.eq.join(', ')}`);
     if (b.range.length) reasons.push(`range filter on ${b.range[0]}`);
     if (b.sort.length) reasons.push(`sort/group on ${b.sort.join(', ')}`);
-    if (cols.length) out.push({ table, columns: cols, reason: reasons.join('; '), ddl: `CREATE INDEX idx_${table.split('.').pop()}_${cols.join('_')} ON ${table} (${cols.join(', ')});` });
+    if (cols.length) out.push({ table, columns: cols, reason: reasons.join('; '), ddl: ddl(table, cols) });
     const joinOnly = b.join.filter((c) => !cols.includes(c));
     for (const jc of joinOnly) {
       if (/^id$/i.test(jc)) continue; // primary key already indexed
-      out.push({ table, columns: [jc], reason: `join key ${jc}`, ddl: `CREATE INDEX idx_${table.split('.').pop()}_${jc} ON ${table} (${jc});` });
+      out.push({ table, columns: [jc], reason: `join key ${jc}`, ddl: ddl(table, [jc]) });
     }
   }
   return out;
