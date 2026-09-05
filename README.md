@@ -56,7 +56,7 @@ QueryLens fixes that trade-off:
 
 ### 1 · Analyze & Optimize
 
-Paste any statement and get, in real time:
+Paste any statement, pick a **dialect** (or leave it on *Generic SQL*), and get, in real time:
 
 - **Explanation** — a numbered, colour-coded walkthrough of each clause. Conditions are humanised (`u.age >= 18` → "`u.age` is at least 18"), joins are described semantically (LEFT JOIN → "keep every row from the left side…").
 - **Findings** — 50+ rules across five categories:
@@ -72,8 +72,21 @@ Paste any statement and get, in real time:
   Plus schema reviews for `CREATE TABLE` (missing PK, FLOAT for money, undeclared FKs, all-nullable columns…).
 - **Optimized** — a semantics-preserving rewrite with a change log:
   `= NULL → IS NULL` · `YEAR(col) = y → half-open range` · `OR`-chains → `IN (…)` · `NOT IN (subq) → NOT EXISTS` · comma joins → explicit `JOIN … ON` · redundant `DISTINCT` removed · `LIKE` without wildcards → `=`
-- **Indexes** — heuristic composite index suggestions (equality → range → sort columns) as ready-to-run DDL.
+- **Indexes** — heuristic composite index suggestions (equality → range → sort columns) as ready-to-run DDL, in the selected dialect's syntax (`CREATE INDEX CONCURRENTLY`, `ALTER TABLE … ADD INDEX …, ALGORITHM=INPLACE`, `WITH (ONLINE = ON)`, …).
 - **Structure** — tables, join graph, predicates (with sargability flags), grouping, sorting, parameters, complexity score.
+
+#### Dialect-aware rule packs
+
+The generic ruleset always runs. Choosing a dialect layers an engine-specific pack on top — it can **add** findings, **re-word** generic ones with the right advice for that engine, or **drop** ones that don't apply. Findings from a pack carry a small `PG` / `MY` / `MS` / `LITE` badge, and QueryLens will suggest switching when the SQL clearly looks like another engine's syntax (backticks, `TOP`, `::casts`, `AUTOINCREMENT`…).
+
+| Dialect | Examples of what the pack catches |
+|---|---|
+| 🐘 **PostgreSQL** | `"Double-quoted strings"` are identifiers · quoted mixed-case names & case folding · `col::date = …` / `date_trunc()` in WHERE (auto-rewritten to a range) · `ILIKE`/`LOWER()` need `pg_trgm` or expression indexes · `NULLS FIRST` on `DESC` sorts · `SERIAL` → `IDENTITY` · `timestamp` without time zone · FK columns are not auto-indexed · `CREATE INDEX CONCURRENTLY` · MySQL/T-SQL syntax that won't parse |
+| 🐬 **MySQL** | `ONLY_FULL_GROUP_BY` violations · `DATE_FORMAT()` in WHERE (auto-rewritten) · VARCHAR column compared to a number (row-by-row cast) · collation conversions in JOINs · `utf8` vs `utf8mb4` · MyISAM · `TIMESTAMP` 2038 limit · UUIDs in `CHAR(36)` PKs · `INT(11)` display widths · deferred-join pagination · Postgres/T-SQL syntax that won't parse |
+| 🪟 **SQL Server** | `NOLOCK` · `TOP` without `ORDER BY` · `ISNULL(col, x) = x` (auto-rewritten to `col = x OR col IS NULL`) · `DATEDIFF`/`DATEADD`/`CONVERT` on columns · `N'…'` vs `VARCHAR` implicit conversion · `@@IDENTITY` · `+` concatenation swallowing NULLs · `NVARCHAR(MAX)` everywhere · random-GUID clustered keys · `LIMIT` → `OFFSET … FETCH` (auto-rewritten) |
+| 🪶 **SQLite** | type affinity & `STRICT` · `INT PRIMARY KEY` is not a rowid alias · needless `AUTOINCREMENT` · `WITHOUT ROWID` · `PRAGMA foreign_keys` · `LIKE` vs `NOCASE` indexes · `strftime()` in WHERE (auto-rewritten) · `DECIMAL` is really a double · no `TRUNCATE`/`ALTER COLUMN` · double-quoted string fallback |
+
+Your dialect choice is remembered locally and pre-fills the **Database** field in the AI Prompt Builder, so included findings are engine-specific there too.
 
 ### 2 · Interactive Playground *(learning mode)*
 
@@ -133,6 +146,8 @@ Open the printed URL (usually `http://localhost:5173`).
 npm run build
 ```
 
+Other scripts: `npm run typecheck` (strict TS) and `npm run check:dialects` (prints every sample's findings under every dialect pack — handy when adding rules).
+
 Produces **a single self-contained `dist/index.html`** — JS, CSS *and the SQLite WebAssembly binary* are inlined. Open it directly from disk, drop it on any static host, or share it internally. No server, no telemetry, no external requests.
 
 ```bash
@@ -175,6 +190,11 @@ src/
     ├── tokenizer.ts               # Hand-written SQL tokenizer (strings, comments, params,
     │                              #   paren depth, soft-keyword reclassification)
     ├── analyzer.ts                # Structural parser → explanation · findings · rewrite · indexes
+    ├── dialects/                  # Dialect rule packs layered on the generic ruleset
+    │   ├── index.ts               #   registry, DIALECT_LIST, detectDialect()
+    │   ├── types.ts               #   DialectPack / RuleContext contracts
+    │   ├── shared.ts              #   foreign-syntax reporter, range rewrites, helpers
+    │   ├── postgres.ts · mysql.ts · mssql.ts · sqlite.ts
     ├── db.ts                      # BrowserDb: sql.js wrapper, schema snapshots, diff-based
     │                              #   event log, session variables, EXPLAIN annotations
     ├── anonymizer.ts              # Identifier / literal masking with reversible mapping
@@ -185,6 +205,7 @@ src/
 **Design notes**
 
 - **No heavyweight SQL parser.** A purpose-built tokenizer tracks parenthesis depth so clauses can be split at the right level; this keeps the bundle small and handles multiple dialects leniently (PostgreSQL, MySQL, SQL Server, SQLite syntax all tokenize fine).
+- **Dialect packs are additive.** `analyzeSql(sql, { dialect })` runs the generic rules first, then hands the result to the pack through a small `RuleContext` (`add` / `amend` / `remove` / `fnIssue`). Packs never replace the parser, so a new engine is a single file: an `info` block, a `rules()` function, optional `rewrite()` regexes and an `indexDdl()` template. Add one to `DIALECT_PACKS` and it appears in the selector.
 - **Rewrites are conservative by design.** Anything that could change the result set (e.g. `DISTINCT` after a join, scalar subqueries → `LEFT JOIN`) is surfaced as a *manual* suggestion instead of being applied automatically.
 - **The playground diffs schema snapshots** before and after each statement to describe what changed, rather than trying to predict effects from the SQL text.
 - **Single-file output** via `vite-plugin-singlefile`, so the whole tool can live on a USB stick or an air-gapped machine.
@@ -217,7 +238,8 @@ Or in **Playground**, load *Learn: indexes & query plans* and watch the plan fli
 
 ## 🗺️ Roadmap ideas
 
-- [ ] Dialect-aware rule sets (PostgreSQL / MySQL / T-SQL specific advice)
+- [x] Dialect-aware rule sets (PostgreSQL / MySQL / T-SQL / SQLite specific advice)
+- [ ] More dialects (Oracle, MariaDB-specific, BigQuery, Snowflake) — see `src/lib/dialects/`
 - [ ] Visual join-graph / ER diagram for the playground schema
 - [ ] Import a `.sqlite` file or a `schema.sql` dump into the playground
 - [ ] Export / import session as JSON

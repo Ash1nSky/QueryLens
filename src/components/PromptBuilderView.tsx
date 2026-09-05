@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeftRight, EyeOff, FileText, KeyRound, ShieldCheck, Sparkles, Wand2 } from 'lucide-react';
 import { analyzeSql } from '@/lib/analyzer';
+import { dialectToPromptName, promptNameToDialect, type DialectId } from '@/lib/dialects';
 import { anonymizeSql, deanonymize, type AnonymizeResult } from '@/lib/anonymizer';
 import { buildPrompt, DIALECTS, GOALS, type PromptGoal } from '@/lib/prompt';
 import { SqlCode, SqlEditor } from './SqlEditor';
@@ -11,11 +12,15 @@ interface Props {
   sql: string;
   setSql: (s: string) => void;
   schemaDdl: string;
+  /** Dialect chosen in Analyze mode — pre-fills the "Database" field and drives the included findings. */
+  analyzerDialect?: DialectId;
 }
 
-export function PromptBuilderView({ sql, setSql, schemaDdl }: Props) {
+export function PromptBuilderView({ sql, setSql, schemaDdl, analyzerDialect = 'generic' }: Props) {
   const [goal, setGoal] = useState<PromptGoal>('optimize');
-  const [dialect, setDialect] = useState('PostgreSQL');
+  const [dialect, setDialect] = useState(() => (analyzerDialect !== 'generic' ? dialectToPromptName(analyzerDialect) : 'PostgreSQL'));
+  // follow the analyzer's choice when it changes (user can still override here)
+  useEffect(() => { if (analyzerDialect !== 'generic') setDialect(dialectToPromptName(analyzerDialect)); }, [analyzerDialect]);
   const [targetDialect, setTargetDialect] = useState('MySQL');
   const [anonIdents, setAnonIdents] = useState(true);
   const [anonStrings, setAnonStrings] = useState(true);
@@ -29,7 +34,8 @@ export function PromptBuilderView({ sql, setSql, schemaDdl }: Props) {
   const [customQuestion, setCustomQuestion] = useState('');
   const [aiReply, setAiReply] = useState('');
 
-  const analysis = useMemo(() => (sql.trim() ? analyzeSql(sql) : null), [sql]);
+  // run the local analysis with the same dialect the prompt targets, so included findings are engine-specific
+  const analysis = useMemo(() => (sql.trim() ? analyzeSql(sql, { dialect: promptNameToDialect(dialect) }) : null), [sql, dialect]);
   const anonymizing = anonIdents || anonStrings || anonNumbers;
 
   const anon: AnonymizeResult = useMemo(() => {
